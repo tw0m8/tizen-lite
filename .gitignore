@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+*.log
+.env
+
+# build artefacts: regenerate with ./scripts/package-agensi.sh
+dist/agensi/
+dist/*.zip

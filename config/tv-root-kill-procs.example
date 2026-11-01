@@ -1,0 +1,16 @@
+# Process patterns killed after each boot apply (pkill -f regex, bracketed so the
+# pattern in this file/applier command line cannot match the shell running it).
+# Art Mode (art-app 128 MB + home.art 59 MB; art-app is early in the boot queue).
+opt/usr/apps/org[.]tizen[.]art-app
+opt/usr/apps/com[.]samsung[.]tv[.]home[.]art
+# Samsung ad / recommendation engine (respawns; best-effort only).
+opt/usr/apps/com[.]samsung[.]tv[.]mde[-]framework
+# TV Plus: service + standalone app (uninstalled to backup 2026-11-01).
+opt/usr/apps/com[.]samsung[.]tv[.]slive[-]daemon/bin
+opt/usr/apps/com[.]samsung[.]tv[.]tvplus/bin
+opt/usr/apps/HEPsq[F]Nie0/bin
+slive[-]provider[-]dae
+# AirPlay + Samsung account cloud (uninstalled to backup k3-01, user-approved).
+# SmartThings, Google Cast and contentservicemanager are deliberately NOT killed.
+opt/usr/apps/com[.]samsung[.]tv[.]airplay[-]app[-]2
+opt/usr/apps/com[.]samsung[.]tizen[.]samsung[-]cloud

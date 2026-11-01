@@ -1,0 +1,17 @@
+# Perf kill-list, overriding PERF_UNITS in tv-root-apply (read at start of each apply).
+# Edit this file to bisect; empty/comments = mask nothing.
+#
+# aaa_tvs_deamon is deliberately NOT here: masking it breaks Prime Video playback
+# on this set (found by boot bisect 2026-10-31; the app opens and reports
+# "Something went wrong. Please try again later" for every video).
+swu-auto-upgrade
+reporterCA
+emergency-log-transmitter
+pvod-appfw.pvodservice
+wireless-cam-service
+wifi-presence
+mirroring-recognition-manager
+ambient-ua-agent
+pisa-service
+nagsam-daemon
+ua-manager

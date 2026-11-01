@@ -1,0 +1,19 @@
+---
+description: Tizen Lite — debloating a Samsung Tizen TV safely
+globs: ["**/*.md", "bin/**", "agent/**"]
+alwaysApply: false
+---
+
+When working on a Samsung Tizen TV (debloat, root, lag, ads, privacy):
+
+1. Run `./agent/audit.sh` first; decide from its JSON, not from assumptions.
+2. Never touch `aaa_tvs_deamon` (DRM), `com.samsung.tv.home.sidebar` +
+   `com.samsung.tv.contentservicemanager` (quick settings), `dta-agent` (CDM), `sdbd` (root transport),
+   `com.samsung.tv.csfs`, or the configured home app.
+3. One change per cold boot. Live changes cannot reveal a boot-time dependency.
+4. Units: mask `--runtime` **and** stop (SIGKILL if stuck in `deactivating`). Apps: disable the package
+   records **and** move the directory out of `/opt/usr/apps`; `launchpad-process-pool` restarts the rest.
+5. There are no logs on this firmware — bisect, do not hunt `journalctl`/`dlogutil`.
+6. Report: Diagnosis / Evidence / Change / Risk / Rollback / Your turn.
+
+Full contract: `AGENTS.md` and `agent/manifest.json`.

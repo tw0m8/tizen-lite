@@ -1,0 +1,17 @@
+[Unit]
+Description=Tizen Lite command relay (the TV polls this, so the TV has no inbound port)
+Documentation=https://github.com/tw0m8/tizenlite
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/tv-agent-server.py
+Restart=always
+RestartSec=3
+StateDirectory=tv-agent
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

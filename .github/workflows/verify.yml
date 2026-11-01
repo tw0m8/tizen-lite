@@ -1,0 +1,68 @@
+name: verify
+
+# Proves the shipped tooling still parses, lints and agrees with itself.
+# Nothing here touches a TV: these are static checks only.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell syntax
+        run: |
+          set -euo pipefail
+          for f in $(git ls-files '*.sh') install.sh restore.sh build-bundle.sh; do
+            bash -n "$f"
+          done
+          echo "shell syntax ok"
+
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          shellcheck -S warning $(git ls-files '*.sh') install.sh restore.sh build-bundle.sh
+          echo "shellcheck clean"
+
+      - name: python compiles
+        run: |
+          set -euo pipefail
+          python3 -m py_compile bin/tvlib.py bin/tv-agent-server.py bin/tv bin/tv-agent \
+            bin/tv-root-apply bin/tv-root-watchdog
+          echo "python ok"
+
+      - name: json parses
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, subprocess
+          files = subprocess.run(["git", "ls-files", "*.json"], capture_output=True, text=True).stdout.split()
+          for f in files:
+              json.load(open(f))
+          print(f"{len(files)} json files ok")
+          PY
+
+      - name: skill frontmatter parses
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          for f in glob.glob("skills/*/SKILL.md"):
+              head = open(f).read().split("---", 2)[1]
+              assert "name:" in head and "description:" in head, f
+          print("skill frontmatter ok")
+          PY
+
+      - name: no host identifiers in the tree
+        run: |
+          set -euo pipefail
+          # the workflow itself contains the pattern, so exclude it from the scan
+          if git grep -nIE '192\.168\.|ghp_|/root/|2DCLIM2YQC4XA|c8:12:0b' -- . ':!.github/workflows/verify.yml' ; then
+            echo "FAIL: host identifiers found in the published tree"
+            exit 1
+          fi
+          echo "no host identifiers"

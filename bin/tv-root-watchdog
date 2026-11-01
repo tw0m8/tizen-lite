@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""tv-root-watchdog — re-arm the volatile root chain after every TV power-on.
+
+Runs as a systemd service, polls every POLL seconds. It only acts on a
+power-on transition of the TV (off/unreachable -> reachable), and only when
+AUTO_ACQUIRE=1 in /etc/default/tv-root. Without that flag it is a pure
+observer: it records TV state and does nothing to the TV.
+
+A "verification acquisition" runs `id -u` as uid 0 on the TV: it confirms the
+SVE-2025-50109 + archive route still works on the current firmware, so a later
+real command is not the first thing that discovers a broken chain.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import subprocess
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+ENV_FILE = Path(os.environ.get("TV_ROOT_SETTINGS", "/etc/default/tv-root"))
+STATE_DIR = Path(os.environ.get("TV_STATE_DIR", "/run/tv-root"))
+STATUS_FILE = STATE_DIR / "status.json"
+LOG_FILE = Path(os.environ.get("TV_LOG_FILE", "/var/log/tv-root/watchdog.log"))
+
+POLL = 30
+MAX_ATTEMPTS = 4
+SETTLE_S = 30      # let the set finish starting services before probing
+RETRY_S = 25       # gap between acquisition attempts
+DEBLOAT_TOOL = "/usr/local/bin/tv-debloat"
+APPLY_TOOL = "/usr/local/bin/tv-root-apply"
+AGENT_TOOL = "/usr/local/bin/tv-agent-start"
+
+
+PLACEHOLDER_HOSTS = {"", "192.0.2.10", "0.0.0.0", "CHANGEME"}
+
+
+def load_env() -> dict[str, str]:
+    env = {
+        "TV_HOST": "192.0.2.10",
+        "AUTO_ACQUIRE": "0",
+        "TV_ROOT_TOOL": "/usr/local/bin/tv-root",
+    }
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env[key.strip()] = value.strip().strip("\"'")
+    return env
+
+
+def log(message: str) -> None:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    with LOG_FILE.open("a") as handle:
+        handle.write(f"{stamp} {message}\n")
+
+
+def tv_state(host: str) -> dict[str, object]:
+    """Reachability + developer-mode facts straight from the TV REST API."""
+    state: dict[str, object] = {"reachable": False, "power": None, "developer_mode": None,
+                                "developer_ip": None}
+    try:
+        with urllib.request.urlopen(f"http://{host}:8001/api/v2/", timeout=4) as response:
+            device = json.load(response).get("device", {})
+    except Exception:
+        return state
+    state.update(
+        reachable=True,
+        power=device.get("PowerState"),
+        developer_mode=device.get("developerMode"),
+        developer_ip=device.get("developerIP"),
+    )
+    return state
+
+
+def write_status(payload: dict[str, object]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATUS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def ensure_sdb(host: str) -> str:
+    """Reattach sdb after a power cycle; a dropped attachment fails every
+    acquisition with an unrelated-looking error."""
+    sdb = "/usr/local/bin/sdb"
+    target = f"{host}:26101"
+    try:
+        listed = subprocess.run([sdb, "devices"], capture_output=True, text=True, timeout=30, check=False)
+    except subprocess.TimeoutExpired:
+        return "sdb devices: timeout"
+    if host in (listed.stdout or ""):
+        return "attached"
+    subprocess.run([sdb, "kill-server"], capture_output=True, text=True, timeout=30, check=False)
+    subprocess.run([sdb, "start-server"], capture_output=True, text=True, timeout=30, check=False)
+    conn = subprocess.run([sdb, "connect", target], capture_output=True, text=True, timeout=60, check=False)
+    out = ((conn.stdout or "") + (conn.stderr or "")).strip().splitlines()
+    return out[-1][:120] if out else "no output"
+
+
+def ensure_launcher(tool: str, app_id: str = "FreeMyTVio.FreeMyTV") -> str:
+    """Get the Home app on screen as early as root allows.
+
+    A cold boot otherwise sits on the last-used input (the PS4 HDMI) until the
+    framework eventually reaches the Home operation, minutes later.
+    """
+    safe_id = shlex.quote(app_id)
+    cmd = (
+        "if app_launcher -S 2>/dev/null | grep -q " + safe_id + "; then echo already-running; "
+        "else app_launcher -u 5001 -s " + safe_id + " >/dev/null 2>&1 && echo launched || echo launch-failed; fi"
+    )
+    try:
+        out = subprocess.run([tool, cmd], capture_output=True, text=True, timeout=180, check=False)
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    text = ((out.stdout or "") + (out.stderr or "")).strip()
+    for token in ("already-running", "launched", "launch-failed"):
+        if token in text:
+            return token
+    return text.splitlines()[-1][:80] if text else "no-output"
+
+
+def verify(tool: str) -> tuple[bool, str]:
+    result = subprocess.run(  # noqa: S603 - fixed path from /etc/default/tv-root
+        [tool, "id -u"], capture_output=True, text=True, timeout=180, check=False
+    )
+    output = (result.stdout + result.stderr).strip()
+    ok = result.returncode == 0 and "0" in output.split()
+    return ok, output[-400:]
+
+
+def main() -> None:
+    env = load_env()
+    host = env["TV_HOST"]
+    auto = env.get("AUTO_ACQUIRE", "0") == "1"
+    tool = env["TV_ROOT_TOOL"]
+
+    if host.strip() in PLACEHOLDER_HOSTS:
+        # A watchdog aimed at a placeholder is worse than no watchdog: it would
+        # report "unreachable" forever and look like a network fault.
+        log(f"refusing to run: TV_HOST is {host!r}. Set TV_HOST=<your TV's LAN IP> in /etc/default/tv-root")
+        raise SystemExit(2)
+
+    log(f"watchdog start host={host} auto_acquire={'on' if auto else 'off (observe only)'}")
+
+    was_reachable = False
+    attempts = 0
+    powered_on_at = time.time()
+    last_attempt_at = 0.0
+    status: dict[str, object] = {"host": host, "auto_acquire": auto}
+
+    while True:
+        # Re-read /etc/default/tv-root every cycle: a stale APPLY_GROUPS meant a
+        # new group silently never ran at boot.
+        env = load_env()
+        auto = env.get("AUTO_ACQUIRE", "0") == "1"
+        state = tv_state(host)
+        reachable = bool(state["reachable"])
+
+        if reachable and not was_reachable:
+            attempts = 0
+            powered_on_at = time.time()
+            last_attempt_at = 0.0
+            log(f"TV power-on detected (power={state['power']}, dev_ip={state['developer_ip']})")
+
+        status.update(state)
+        status["root_verified"] = status.get("root_verified") if reachable else False
+
+        # The archive-root timing oracle is unreliable while the TV is still
+        # starting services ("control 0.75 s vs delay 2.1 s" reads as failure),
+        # so settle first and retry across cycles instead of giving up at power-on.
+        settled = (time.time() - powered_on_at) >= SETTLE_S
+        if (
+            reachable
+            and auto
+            and settled
+            and not status.get("root_verified")
+            and attempts < MAX_ATTEMPTS
+            and (time.time() - last_attempt_at) >= RETRY_S
+        ):
+            attempts += 1
+            last_attempt_at = time.time()
+            log(f"verification acquisition attempt {attempts}/{MAX_ATTEMPTS}")
+            sdb_state = ensure_sdb(host)
+            if sdb_state != "attached":
+                log(f"sdb reattach: {sdb_state}")
+            try:
+                ok, output = verify(tool)
+            except subprocess.TimeoutExpired:
+                ok, output = False, "timeout"
+            status["root_verified"] = ok
+            status["last_attempt"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            status["last_output"] = output
+            log(f"verification acquisition {'OK' if ok else 'FAILED'}: {output[:200]}")
+            if ok:
+                state_launcher = ensure_launcher(tool)
+                status["launcher"] = state_launcher
+                log(f"launcher: {state_launcher}")
+
+            if ok and env.get("DEBLOAT", "0") == "1":
+                try:
+                    deb = subprocess.run(  # noqa: S603 - fixed path
+                        [DEBLOAT_TOOL], capture_output=True, text=True, timeout=180, check=False
+                    )
+                    summary = (deb.stdout + deb.stderr).strip().replace("\n", " ")
+                    status["debloat"] = summary[-300:]
+                    log(f"debloat {'OK' if deb.returncode == 0 else 'FAILED'}: {summary[:200]}")
+                except subprocess.TimeoutExpired:
+                    status["debloat"] = "timeout"
+                    log("debloat FAILED: timeout")
+
+            if ok and env.get("APPLY", "0") == "1":
+                groups = env.get("APPLY_GROUPS", "home,memory,privacy,ota,voice")
+                try:
+                    apply_run = subprocess.run(  # noqa: S603 - fixed path
+                        [APPLY_TOOL, "--only", groups],
+                        capture_output=True, text=True, timeout=300, check=False,
+                    )
+                    summary = (apply_run.stdout + apply_run.stderr).strip().replace("\n", " ")
+                    status["apply"] = summary[-300:]
+                    log(f"apply {'OK' if apply_run.returncode == 0 else 'FAILED'}: {summary[:300]}")
+                except subprocess.TimeoutExpired:
+                    status["apply"] = "timeout"
+                    log("apply FAILED: timeout")
+
+            if env.get("AGENT", "0") == "1":
+                # The agent needs a root acquisition of its own; the launcher can
+                # report a timeout even when the loop started, so trust the poll
+                # status, not the exit code.
+                try:
+                    agent_run = subprocess.run(  # noqa: S603 - fixed path
+                        [AGENT_TOOL], capture_output=True, text=True, timeout=300, check=False
+                    )
+                    summary = (agent_run.stdout + agent_run.stderr).strip().replace("\n", " ")
+                    status["agent"] = summary[-300:]
+                    log(f"agent rc={agent_run.returncode}: {summary[:200]}")
+                except subprocess.TimeoutExpired:
+                    status["agent"] = "timeout"
+                    log("agent FAILED: timeout")
+
+        was_reachable = reachable
+        write_status(status)
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    main()

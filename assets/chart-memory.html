@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{width:1400px;height:580px;overflow:hidden;color:#e8f1f8;
+       font-family:-apple-system,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+       background:radial-gradient(1100px 600px at 10% -10%,#14263a 0%,#0b1017 55%,#070a0e 100%);}
+  .wrap{padding:44px 56px}
+  .kicker{font-size:14px;letter-spacing:.2em;text-transform:uppercase;color:#7fd8c9;font-weight:700}
+  h1{margin-top:10px;font-size:40px;font-weight:800;letter-spacing:-1.2px}
+  h1 span{color:#9fb3c6;font-weight:600;font-size:22px;letter-spacing:0;display:block;margin-top:8px}
+  .chart{margin-top:34px}
+  .row{display:flex;align-items:center;margin-bottom:22px}
+  .lab{width:250px;font-size:16px;color:#c6d6e3}
+  .lab b{display:block;font-size:17px;color:#eaf3fa}
+  .lab i{font-style:normal;color:#7f93a8;font-size:13px}
+  .track{flex:1;height:44px;background:rgba(255,255,255,.055);border-radius:10px;position:relative;
+         border:1px solid rgba(255,255,255,.07)}
+  .bar{height:100%;border-radius:9px;display:flex;align-items:center;justify-content:flex-end;
+       padding-right:12px;font-weight:750;font-size:17px;color:#04121a}
+  .b1{width:48.5%;background:linear-gradient(90deg,#8b6b6b,#c98b8b)}
+  .b2{width:77%;background:linear-gradient(90deg,#3e7d8a,#63c0c9)}
+  .b3{width:90.7%;background:linear-gradient(90deg,#1f9d7a,#4be3b0)}
+  .axis{display:flex;margin-left:250px;margin-top:6px;font-size:12px;color:#6d8095}
+  .axis div{flex:1;border-left:1px solid rgba(255,255,255,.06);padding-left:6px}
+  .note{margin-top:26px;display:flex;gap:16px}
+  .card{flex:1;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);
+        border-radius:14px;padding:16px 18px}
+  .card .t{font-size:13px;letter-spacing:.1em;text-transform:uppercase;color:#7f93a8}
+  .card .v{margin-top:7px;font-size:26px;font-weight:780;letter-spacing:-.5px}
+  .card .d{margin-top:5px;font-size:14px;color:#93a7ba;line-height:1.35}
+  .up{color:#4be3b0}.dn{color:#ffb86b}
+</style></head><body><div class="wrap">
+  <div class="kicker">Tizen Lite · measured, not estimated</div>
+  <h1>How much memory comes back
+    <span>Idle readings on a 2024 Q60D, after a cold boot — not during playback</span></h1>
+
+  <div class="chart">
+    <div class="row">
+      <div class="lab"><b>Stock TV</b><i>as shipped</i></div>
+      <div class="track"><div class="bar b1">340 MB</div></div>
+    </div>
+    <div class="row">
+      <div class="lab"><b>+ background services off</b><i>telemetry, ads, OTA, promos</i></div>
+      <div class="track"><div class="bar b2">540 MB</div></div>
+    </div>
+    <div class="row">
+      <div class="lab"><b>+ heavy apps removed</b><i>Art Mode, TV Plus, ACR, setup, cloud</i></div>
+      <div class="track"><div class="bar b3">635 MB</div></div>
+    </div>
+    <div class="axis">
+      <div>0</div><div>140</div><div>280</div><div>420</div><div>560</div><div>700 MB</div>
+    </div>
+  </div>
+
+  <div class="note">
+    <div class="card"><div class="t">Free memory</div>
+      <div class="v up">+87 %</div><div class="d">340 → 635 MB available at idle</div></div>
+    <div class="card"><div class="t">Swap used</div>
+      <div class="v up">−255 MB</div><div class="d">768 → 513 MB — less thrashing to disk</div></div>
+    <div class="card"><div class="t">Video memory (CMA)</div>
+      <div class="v up">6 → 112 MB</div><div class="d">what kills micro-freezes in playback</div></div>
+    <div class="card"><div class="t">Running apps</div>
+      <div class="v dn">51 → 33</div><div class="d">fewer things competing for one slow chip</div></div>
+  </div>
+</div></body></html>

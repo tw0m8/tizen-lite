@@ -1,0 +1,293 @@
+{
+  "schema": "tizen-lite/agent-manifest/1",
+  "updated": "2026-11-01",
+  "purpose": "Root-on-demand managed-state debloat for Samsung Tizen TVs. This manifest is the machine-readable contract an agent should trust before touching a unit or an app.",
+  "entry_point": "AGENTS.md",
+  "entry_point_compat": "agent/GUIDE.md",
+  "discover": {
+    "command": "./agent/audit.sh",
+    "read_only": true,
+    "emits": "json",
+    "order": [
+      "host",
+      "reachability",
+      "root",
+      "units",
+      "apps",
+      "memory",
+      "launcher"
+    ],
+    "output": {
+      "schema": "tizen-lite/audit/1",
+      "keys": {
+        "host": "settings_file, tv_host, apply_groups, agent_enabled, masked_unit_count, kill_pattern_count",
+        "tv": "reachable (bool), api_http_code, status (power, root_ok, agent_alive, uptime_s, mem_avail_mb, running_apps, home_app), launcher_start_offset_s",
+        "state.units": "unit -> is-active (inactive|failed|active)",
+        "state.app_processes": "pattern -> match count (0 = nothing running)",
+        "state.app_dirs": "list of directory names under /opt/usr/apps - an id absent here is never-installed or already removed",
+        "state.memory": "mem_available_kb, swap_free_kb, cma_free_kb",
+        "invariants.units": "load-bearing unit -> {active, enabled}; enabled empty/unknown means that unit name does not exist on this firmware"
+      },
+      "example": "{\"schema\":\"tizen-lite/audit/1\",\"host\":{...},\"tv\":{\"reachable\":true,...},\"state\":{\"units\":{...},\"app_dirs\":[...],\"memory\":{...}},\"invariants\":{\"units\":{...}}}"
+    }
+  },
+  "host": {
+    "settings_file": "/etc/default/tv-root",
+    "apply_groups": [
+      "home",
+      "memory",
+      "privacy",
+      "ota",
+      "voice",
+      "perf"
+    ],
+    "state_files": {
+      "masked_units": "/etc/tv-root-perf-units",
+      "killed_processes": "/etc/tv-root-kill-procs"
+    },
+    "tools": {
+      "apply": "/usr/local/bin/tv-root-apply",
+      "watchdog": "/usr/local/bin/tv-root-watchdog",
+      "cli": "/usr/local/bin/tv",
+      "agent_relay": "/usr/local/bin/tv-agent-server.py"
+    },
+    "apply_groups_map": {
+      "home": "which app owns the Home key (appsvc row + startup app id) - writes the TV's app framework DB",
+      "memory": "package records for the heavy apps (app_disable/app_autorestart)",
+      "privacy": "ACR/presence/telemetry flags and their app records",
+      "ota": "firmware-update units and ad/analytics services",
+      "voice": "voice-recognition units and flags",
+      "perf": "the unit masks listed in /etc/tv-root-perf-units + the patterns in /etc/tv-root-kill-procs",
+      "_note": "Groups are internal to tv-root-apply. Nothing in this file can express a single-unit change; for one-variable work, edit the two state files and run the applier with --only perf, or mask one unit directly."
+    }
+  },
+  "invariants": {
+    "never_remove": [
+      {
+        "id": "aaa_tvs_deamon",
+        "kind": "systemd_unit",
+        "breaks": "Prime Video / PlayReady licence path",
+        "symptom": "App opens, every video fails with 'Something went wrong. Please try again later.'",
+        "found_by": "boot bisect 2026-11-01"
+      },
+      {
+        "id": "com.samsung.tv.home.sidebar",
+        "kind": "app_dir",
+        "breaks": "quick-settings panel rendering",
+        "symptom": "Panel opens, every control reads 'Preparing... Please try again later'"
+      },
+      {
+        "id": "com.samsung.tv.contentservicemanager",
+        "kind": "app_dir",
+        "breaks": "quick-settings panel data providers",
+        "symptom": "same 'Preparing...' failure as above"
+      },
+      {
+        "id": "dta-agent",
+        "kind": "systemd_unit",
+        "breaks": "CDM / PlayReady trusted application install",
+        "symptom": "DRM playback fails for every protected app"
+      },
+      {
+        "id": "sdbd",
+        "kind": "systemd_unit",
+        "breaks": "root transport; also only starts ~121s into boot",
+        "symptom": "root acquisition fails, nothing applies"
+      },
+      {
+        "id": "com.samsung.tv.csfs",
+        "kind": "app_dir",
+        "breaks": "core content framework",
+        "symptom": "broad UI instability"
+      },
+      {
+        "id": "home_app",
+        "kind": "setting",
+        "value": "FreeMyTVio.FreeMyTV",
+        "breaks": "the human's launcher",
+        "symptom": "Home key shows nothing or a blank screen"
+      }
+    ],
+    "one_variable_per_cycle": true,
+    "requires_reboot_to_verify": true,
+    "live_changes_prove_nothing": "A licence/panel acquired before the change keeps working, so a live test can report success for a unit that is actually required at boot."
+  },
+  "verified_removable": [
+    {
+      "id": "art-app + home.art",
+      "kind": "app_dir",
+      "reclaimed_mb": 187,
+      "note": "Art Mode"
+    },
+    {
+      "id": "HEPsqFNie0.tvplusstandalone + com.samsung.tv.tvplus + com.samsung.tv.slive-daemon",
+      "kind": "app_dir",
+      "note": "TV Plus, live channel service"
+    },
+    {
+      "id": "com.samsung.tv.home.media",
+      "kind": "app_dir",
+      "reclaimed_mb": 112,
+      "note": "Samsung Home app; not needed while sidebar+contentservicemanager present"
+    },
+    {
+      "id": "com.samsung.tv.airplay-app-2",
+      "kind": "app_dir",
+      "reclaimed_mb": 16
+    },
+    {
+      "id": "com.samsung.tizen.samsung-cloud",
+      "kind": "app_dir",
+      "reclaimed_mb": 10
+    },
+    {
+      "id": "com.samsung.tv.vif",
+      "kind": "app_dir",
+      "reclaimed_mb": 14,
+      "note": "ACR / viewing-data recognition"
+    },
+    {
+      "id": "com.samsung.tv.context-aware-service + com.samsung.tv.context-aware-agent",
+      "kind": "app_dir",
+      "reclaimed_mb": 21
+    },
+    {
+      "id": "com.samsung.tv.easysetup-daemon",
+      "kind": "app_dir",
+      "reclaimed_mb": 16
+    },
+    {
+      "id": "com.samsung.tv.tap-service-agent",
+      "kind": "app_dir",
+      "reclaimed_mb": 10
+    },
+    {
+      "id": "swu-auto-upgrade",
+      "kind": "systemd_unit",
+      "note": "OTA pusher, ~285s into boot"
+    },
+    {
+      "id": "reporterCA, emergency-log-transmitter, pvod-appfw.pvodservice, wireless-cam-service, wifi-presence, mirroring-recognition-manager, ambient-ua-agent, pisa-service, nagsam-daemon, ua-manager",
+      "kind": "systemd_unit",
+      "note": "telemetry / promos / unused hardware"
+    },
+    {
+      "id": "adagent-service, canalysis-service, org.tizen.tv.sp-kpi",
+      "kind": "systemd_unit",
+      "note": "ad + telemetry; data-service excluded, D-Bus activated"
+    }
+  ],
+  "not_worth_it": [
+    {
+      "id": "data-service",
+      "reason": "static + D-Bus activated (TriggeredBy org.tizen.tv.dataservice.busname) - respawns in seconds"
+    },
+    {
+      "id": "mde-framework",
+      "reason": "launchpad restarts it within seconds; roughly 20 MB, not durable"
+    }
+  ],
+  "privacy": {
+    "summary": "Fewer processes that can observe, fingerprint or report usage - verified by cold boot, not by packet inspection.",
+    "acr_removed": {
+      "id": "com.samsung.tv.vif",
+      "kind": "app_dir",
+      "why": "Visual Information Framework - Automatic Content Recognition fingerprints on-screen content"
+    },
+    "presence_removed": [
+      "com.samsung.tv.context-aware-service",
+      "com.samsung.tv.context-aware-agent"
+    ],
+    "telemetry_masked": [
+      "reporterCA",
+      "emergency-log-transmitter",
+      "ua-manager",
+      "wifi-presence",
+      "pisa-service",
+      "ambient-ua-agent"
+    ],
+    "ads_stopped": [
+      "adagent-service",
+      "canalysis-service",
+      "org.tizen.tv.sp-kpi"
+    ],
+    "ota_masked": [
+      "swu-auto-upgrade",
+      "fw-update-service",
+      "fw-update-init-download",
+      "vdca-update"
+    ],
+    "not_claimed": [
+      "no firewall, VPN or DNS filtering is applied by this skill",
+      "no traffic was captured or analysed",
+      "store / account / app-update traffic still reaches Samsung endpoints",
+      "removing a component proves it is not running, not that the TV is silent"
+    ]
+  },
+  "restore": {
+    "layout": "<backup_root>/<change-set>/<app_id|pkgmgr.db.bak>",
+    "backup_root_example": "/opt/usr/share/tv-root-backups",
+    "steps": [
+      "move the app directory back into /opt/usr/apps",
+      "UPDATE package_app_info SET app_disable='false', app_autorestart='true' WHERE package='<pkg>'",
+      "remove the pattern from the kill-procs file",
+      "reboot and re-run ./agent/audit.sh"
+    ]
+  },
+  "measurements": {
+    "idle_baseline": {
+      "ram_available_mb": 340,
+      "swap_used_mb": 768,
+      "cma_free_mb": 6.5,
+      "processes": 51
+    },
+    "after_service_masks": {
+      "ram_available_mb": 540,
+      "swap_used_mb": 634,
+      "cma_free_mb": 72,
+      "processes": 41
+    },
+    "after_app_removals": {
+      "ram_available_mb": 635,
+      "swap_used_mb": 513,
+      "cma_free_mb": 112,
+      "processes": 33
+    },
+    "caveat": "Only compare idle-to-idle; a streaming set holds ~300 MB more."
+  },
+  "apply_contract": {
+    "output_lines": "ITEM|<group>|<check>|<state>",
+    "success_line": "END changed=<n> errors=<n>",
+    "max_command_bytes": 4000,
+    "why": "A single ~13 KB compound command executes only partially: outer groups run, middle groups are silently skipped, exit status still 0."
+  },
+  "traps": [
+    "no journal/dlog on this firmware - bisect, do not hunt logs",
+    "pkill -f / pgrep -f match the caller's own command line - bracket the pattern",
+    "UEP blocks unsigned scripts even as root - ship inline or as data for a signed interpreter",
+    "systemctl mask --runtime does not stop a running unit; some units ignore SIGTERM",
+    "launchpad-process-pool restarts apps regardless of app_disable - move the dir",
+    "REST /api/v2/ answering is not boot; measure launcher offset from /proc/<pid>/stat field 22"
+  ],
+  "commands": {
+    "doctor": "scripts/tv-doctor.sh [--deep]  # prerequisites, plain-language, changes nothing",
+    "discover": "./agent/audit.sh  # read-only state as JSON",
+    "apply": "/usr/local/bin/tv-root-apply --dry-run  # needs an elevated shell; then drop --dry-run",
+    "undo_one_app": "./restore.sh --app <appid>",
+    "undo_all": "./restore.sh --all --yes",
+    "install_host": "./install.sh  # needs an elevated shell",
+    "uninstall_host": "./install.sh --uninstall  # needs an elevated shell",
+    "rebuild_bundle": "./build-bundle.sh",
+    "reboot": "tv power off && sleep 20 && tv wake   # Wake-on-LAN; needs TV_MAC in /etc/default/tv-root. A mains-off cold boot needs a person."
+  },
+  "verified_on": {
+    "model": "QE75Q60",
+    "model_line": "Q60D (2024), 75 inch, EU",
+    "firmware": "T-NKLDDEUC-0090/2123.9",
+    "tizen": "9.0",
+    "kernel": "5.4.249",
+    "root_route": "archive-launcher, one command per acquisition, no persistence on the TV",
+    "note": "Every measurement, unit name and app id in this file came from that one set. On a different model year treat each name as a hypothesis and confirm it with agent/audit.sh plus one cold boot, not as fact.",
+    "model_note": "size + series only; the regional/tuner suffix is omitted"
+  }
+}

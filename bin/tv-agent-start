@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# tv-agent-start — start the polling loop on the TV (idempotent).
+# Needs one root acquisition; skips if the loop is already polling.
+#
+# The TV must be able to reach this host, so the relay URL is worked out here:
+#   TV_AGENT_URL   explicit override, e.g. http://192.0.2.10:8899
+#   TV_AGENT_HOST  this host's LAN address (default: derived from the route to TV_HOST)
+#   TV_AGENT_PORT  default 8899
+#
+#   tv-agent-start --print    resolve everything and show the URL, touch nothing
+set -uo pipefail
+
+TOKEN_FILE=/etc/tv-agent.token
+LOOP=/usr/local/lib/tv-agent/loop.sh
+CLIENT=/usr/local/bin/tv-agent
+TV_ROOT=/usr/local/bin/tv-root
+SETTINGS=/etc/default/tv-root
+
+[ -s "$TOKEN_FILE" ] || { echo "tv-agent-start: missing $TOKEN_FILE" >&2; exit 1; }
+
+PRINT_ONLY=0
+[ "${1:-}" = "--print" ] && PRINT_ONLY=1
+
+TOKEN=$(cat "$TOKEN_FILE")
+[[ "$TOKEN" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "tv-agent-start: token has unexpected characters" >&2; exit 1; }
+
+# --- where will the TV find this relay? -----------------------------------
+if [ -z "${TV_AGENT_URL:-}" ]; then
+  TV_HOST_CONF="${TV_HOST:-}"
+  if [ -z "$TV_HOST_CONF" ] && [ -r "$SETTINGS" ]; then
+    TV_HOST_CONF=$(sed -n 's/^TV_HOST=//p' "$SETTINGS" | tr -d '"' | tail -1)
+  fi
+  AGENT_HOST="${TV_AGENT_HOST:-}"
+  if [ -z "$AGENT_HOST" ]; then
+    AGENT_HOST=$(ip route get "${TV_HOST_CONF:-1.1.1.1}" 2>/dev/null \
+                 | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
+  fi
+  [ -n "$AGENT_HOST" ] || { echo "tv-agent-start: cannot work out this host's LAN IP; set TV_AGENT_HOST" >&2; exit 1; }
+  TV_AGENT_URL="http://$AGENT_HOST:${TV_AGENT_PORT:-8899}"
+fi
+
+# --- build and validate the payload before it goes anywhere ---------------
+PAYLOAD=$(sed -e "s|__TOKEN__|$TOKEN|g" -e "s|__URL__|$TV_AGENT_URL|g" "$LOOP" | base64 -w0)
+DECODED=$(printf '%s' "$PAYLOAD" | base64 -d)
+case "$DECODED" in
+  *__TOKEN__*|*__URL__*) echo "tv-agent-start: placeholder left in the payload" >&2; exit 1 ;;
+esac
+printf '%s' "$DECODED" | bash -n || { echo "tv-agent-start: generated loop does not parse" >&2; exit 1; }
+
+if [ "$PRINT_ONLY" = "1" ]; then
+  echo "relay:   $TV_AGENT_URL"
+  echo "token:   ${#TOKEN} chars (not shown)"
+  echo "payload: $(( ${#DECODED} )) bytes, parses, no placeholders left"
+  exit 0
+fi
+
+# --- already polling? then there is nothing to do -------------------------
+alive_now() { "$CLIENT" --status 2>/dev/null | grep -q '"alive": true'; }
+if alive_now; then
+  sleep 2
+  if alive_now; then
+    echo "tv-agent-start: already polling $TV_AGENT_URL"
+    exit 0
+  fi
+fi
+
+"$CLIENT" --reset >/dev/null 2>&1
+CMD="nohup bash -c \"\$(echo $PAYLOAD | base64 -d)\" >/dev/null 2>&1 & echo AGENT_STARTED"
+
+"$TV_ROOT" "$CMD"

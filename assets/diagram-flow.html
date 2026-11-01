@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{width:1400px;height:600px;overflow:hidden;color:#e8f1f8;
+       font-family:-apple-system,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+       background:radial-gradient(1100px 600px at 85% -10%,#152a3f 0%,#0b1017 55%,#070a0e 100%);}
+  .wrap{padding:44px 56px}
+  .kicker{font-size:14px;letter-spacing:.2em;text-transform:uppercase;color:#7fd8c9;font-weight:700}
+  h1{margin-top:10px;font-size:40px;font-weight:800;letter-spacing:-1.2px}
+  h1 span{color:#9fb3c6;font-weight:600;font-size:22px;letter-spacing:0;display:block;margin-top:8px}
+  .flow{margin-top:46px;display:flex;align-items:stretch;gap:0}
+  .step{flex:1;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.10);
+        border-radius:16px;padding:20px 18px;position:relative}
+  .step .n{font-size:12px;letter-spacing:.14em;color:#6f8499;text-transform:uppercase}
+  .step .h{margin-top:8px;font-size:19px;font-weight:750;letter-spacing:-.3px}
+  .step .b{margin-top:8px;font-size:14px;color:#93a7ba;line-height:1.4}
+  .arrow{width:46px;display:flex;align-items:center;justify-content:center;color:#3f5568;font-size:26px}
+  .boxed{margin-top:34px;display:flex;gap:18px}
+  .big{flex:1.15;border-radius:16px;padding:22px 24px;background:rgba(46,224,182,.09);
+       border:1px solid rgba(46,224,182,.35)}
+  .big .t{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#7fd8c9}
+  .big .h{margin-top:8px;font-size:24px;font-weight:780}
+  .big .b{margin-top:10px;font-size:15px;color:#c2d3e0;line-height:1.5}
+  .side{flex:1;border-radius:16px;padding:22px 24px;background:rgba(255,255,255,.04);
+        border:1px solid rgba(255,255,255,.09)}
+  .side .t{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#7f93a8}
+  .side ul{margin-top:10px;padding-left:18px;font-size:14.5px;color:#b9cad8;line-height:1.55}
+  .side li{margin-bottom:6px}
+  .foot{margin-top:26px;font-size:13.5px;color:#6f8499}
+</style></head><body><div class="wrap">
+  <div class="kicker">Tizen Lite · what runs where</div>
+  <h1>Why it needs a small computer, not a server
+    <span>The TV can’t keep root across a power-off — so something on your LAN re-applies it once per boot</span></h1>
+
+  <div class="flow">
+    <div class="step"><div class="n">1 · on power-on</div><div class="h">Small always-on box</div>
+      <div class="b">A Raspberry Pi, NAS or the PC already on your LAN. Home network only.</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="n">2 · ~20 s</div><div class="h">Attaches &amp; roots</div>
+      <div class="b">Connects over <code>sdb</code>, runs the exploit, verifies uid 0.</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="n">3 · ~40 s</div><div class="h">Applies the state</div>
+      <div class="b">Masks units, disables records, kills the heavy apps, puts your launcher up.</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="n">4 · done</div><div class="h">Slim TV</div>
+      <div class="b">Root is released. Nothing stays running on the TV.</div></div>
+  </div>
+
+  <div class="boxed">
+    <div class="big">
+      <div class="t">The honest answer</div>
+      <div class="h">A server? No. A host? Yes.</div>
+      <div class="b">Nothing is ever sent to the internet and no cloud service is involved. But the dull part —
+        the service masks and the process kills — lives in RAM and dies at power-off, so it has to be
+        re-applied on each boot. That's the small box's only job, and it takes about a minute.</div>
+    </div>
+    <div class="side">
+      <div class="t">Without that box</div>
+      <ul>
+        <li><b>App removals stay removed</b> — those are files and database rows, written once</li>
+        <li><b>Service masks revert</b> — the TV comes back bloated after a power cycle</li>
+        <li><b>Art Mode &amp; co. come back</b> — the kill-list needs a run after boot</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="foot">No cloud · no account · no telemetry from this tool · the TV itself receives nothing it didn’t already have</div>
+</div></body></html>

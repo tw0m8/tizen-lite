@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""tv — compact CLI for the Samsung TV (backend: tvlib.py).
+
+TV side (via the ~1 s root agent):
+  tv status
+  tv run [-t SEC] [-c CHARS] '<shell command>'     refused if it would block the loop
+  tv root '<shell command>'                        one volatile root acquisition (~15-20 s)
+  tv sql <pkgmgr|appsvc|/abs/path.db> '<query>' [-n LIMIT]   # db alias or an absolute .db path
+  tv apps [filter]
+  tv app launch|kill <app_id>
+  tv log file <alias|path> [-n LINES]
+  tv log dlog [-n LINES] [--tag TAG]
+  tv log aliases
+  tv boot [list]
+  tv boot startup <app_id>                         set db/appfw/startup_appid
+  tv boot onboot <app_id> on|off                   set app_onboot in pkgmgr DB
+  tv svc status|start|stop|restart|mask|unmask <unit>
+  tv vconf get <key> | tv vconf set <key> <value> [type]
+  tv agent status|start|reset
+  tv apply [groups] [--dry-run]
+  tv firmware
+
+Host side (this machine):
+  tv power | tv wake [MAC] | tv sdb devices|connect|capability
+  tv dns list | tv dns add <name> <ip> | tv dns remove <name>
+"""
+import json
+import os
+import sys
+
+# tvlib sits next to this script when installed (/usr/local/bin) and when run from the repo.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+sys.path.append("/usr/local/bin")
+import tvlib
+
+
+def _opts(args):
+    """Split '-n 20' / '--tag foo' / '--dry-run' out of positional args."""
+    opts = {"-n": None, "-t": None, "-c": None, "--tag": None}
+    pos, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in opts and i + 1 < len(args):
+            opts[a] = args[i + 1]
+            i += 2
+            continue
+        pos.append(a)
+        i += 1
+    return pos, opts
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+
+    cmd, rest = argv[0], argv[1:]
+    args, opts = _opts(rest)
+    lines = int(opts["-n"]) if opts["-n"] else None
+
+    def emit(obj):
+        print(json.dumps(obj, ensure_ascii=False))
+        return 0
+
+    if cmd == "status":
+        return emit(tvlib.status())
+
+    if cmd == "run":
+        if not args:
+            print("usage: tv run [-t SEC] [-c CHARS] '<command>'")
+            return 2
+        return emit(tvlib.run(" ".join(args),
+                              timeout_s=int(opts["-t"]) if opts["-t"] else 45,
+                              chars=int(opts["-c"]) if opts["-c"] else tvlib.MAX_CHARS))
+
+    if cmd == "root":
+        if not args:
+            print("usage: tv root '<command>'")
+            return 2
+        return emit(tvlib.root(" ".join(args)))
+
+    if cmd == "sql":
+        if len(args) < 2:
+            print("usage: tv sql <db> '<query>' [-n LIMIT]")
+            return 2
+        return emit(tvlib.sql(args[0], args[1], lines or 40))
+
+    if cmd == "apps":
+        return emit(tvlib.apps(args[0] if args else ""))
+
+    if cmd == "app":
+        if len(args) < 2:
+            print("usage: tv app launch|kill <app_id>")
+            return 2
+        return emit(tvlib.app_control(args[0], args[1]))
+
+    if cmd == "log":
+        if not args:
+            print("usage: tv log file <alias> | tv log dlog | tv log aliases")
+            return 2
+        sub = args[0]
+        if sub == "file":
+            if len(args) < 2:
+                print("usage: tv log file <alias|path> [-n LINES]")
+                return 2
+            return emit(tvlib.log_file(args[1], lines or 40))
+        if sub == "dlog":
+            return emit(tvlib.log_dlog(lines or 40, opts["--tag"] or ""))
+        if sub == "aliases":
+            return emit(tvlib.log_aliases())
+        print("unknown log source: %s" % sub)
+        return 2
+
+    if cmd == "boot":
+        sub = args[0] if args else "list"
+        if sub == "list":
+            return emit(tvlib.boot_list())
+        if sub == "startup":
+            if len(args) < 2:
+                print("usage: tv boot startup <app_id>")
+                return 2
+            return emit(tvlib.set_startup(args[1]))
+        if sub == "onboot":
+            if len(args) < 3:
+                print("usage: tv boot onboot <app_id> on|off")
+                return 2
+            return emit(tvlib.set_onboot(args[1], args[2].lower() in ("on", "true", "1")))
+        print("unknown boot action: %s" % sub)
+        return 2
+
+    if cmd == "svc":
+        if len(args) < 2:
+            print("usage: tv svc status|start|stop|restart|mask|unmask <unit>")
+            return 2
+        return emit(tvlib.svc(args[0], args[1]))
+
+    if cmd == "vconf":
+        if args and args[0] == "get" and len(args) >= 2:
+            return emit(tvlib.vconf_get(args[1]))
+        if args and args[0] == "set" and len(args) >= 3:
+            return emit(tvlib.vconf_set(args[1], args[2], args[3] if len(args) > 3 else "string"))
+        print("usage: tv vconf get <key> | tv vconf set <key> <value> [type]")
+        return 2
+
+    if cmd == "agent":
+        return emit(tvlib.agent_action(args[0] if args else "status"))
+
+    if cmd == "apply":
+        groups = "".join(a for a in args if not a.startswith("--"))
+        return emit(tvlib.apply_state(groups, "--dry-run" in args))
+
+    if cmd == "firmware":
+        return emit(tvlib.firmware())
+
+    if cmd == "power":
+        return emit(tvlib.tv_power())
+
+    if cmd == "wake":
+        return emit(tvlib.tv_wake(args[0] if args else tvlib.TV_MAC))
+
+    if cmd == "sdb":
+        return emit(tvlib.sdb(args[0] if args else "devices", args[1] if len(args) > 1 else ""))
+
+    if cmd == "dns":
+        if args and args[0] == "list":
+            return emit(tvlib.dns("list"))
+        if args and args[0] in ("add", "remove") and len(args) >= 2:
+            return emit(tvlib.dns(args[0], args[1], args[2] if len(args) > 2 else ""))
+        print("usage: tv dns list | add <name> <ip> | remove <name>")
+        return 2
+
+    print("unknown command: %s (try: tv --help)" % cmd)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""tv-root-apply — apply/verify the managed TV state in ONE root acquisition.
+
+Constraints on this firmware (measured):
+  * every unsigned script file is refused by the Tizen policy: "[uep] the file
+    is NOT signed" — even under /opt and /home/owner/share/tmp. So no helper
+    script is installed on the TV; the work is sent as one inline command.
+  * sdb wedges after a handful of operations, so one acquisition per run.
+
+Items report as ITEM|<group>|<name>|<state>; states: ok | changed | would-change:x
+| stopped | error.  A second run reports ok for everything already correct.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+LOG_FILE = Path(os.environ.get("TV_APPLY_LOG", "/var/log/tv-root/apply.log"))
+STATE_FILE = Path("/var/lib/tv-root/state.json")
+DEFAULT_GROUPS = ["home", "memory", "privacy", "ota", "voice", "perf"]
+TV_ROOT = "/usr/local/bin/tv-root"
+TV_BUILD = "0090-2123.9"
+
+APPSVC = "/opt/dbspace/user/5001/.appsvc.db"
+PARSER = "/opt/dbspace/.pkgmgr_parser.db"
+MAIN_OP = "http://tizen.org/appcontrol/operation/main"
+HOME_APP = "FreeMyTVio.FreeMyTV"
+
+ADS = ("'adplatform.ADPlayer','com.samsung.tv.ad-web-framework','com.samsung.tv.iacr',"
+       "'com.samsung.tv.targeted-ad-service','com.samsung.tv.adplayer','com.samsung.tv.coba.adagent',"
+       "'com.samsung.tv.acr','com.samsung.tizen.samsung-analytics'")
+VOICE = ("'org.tizen.voice-onboarding','com.samsung.tv.mybixby','com.samsung.tv.voiceassistant-music',"
+         "'org.tizen.voice-client','org.tizen.stt-client','com.samsung.tv.farfieldvoice',"
+         "'com.samsung.tv.ondevice-voice','com.samsung.tv.bixby-prov','org.tizen.voice-app',"
+         "'org.tizen.voice-app-service','com.samsung.tv.bixbycapsuleviewer','com.samsung.tv.wakeup-engine-bixby',"
+         "'com.samsung.tv.voice-instant-app','com.samsung.tv.voiceid-service','com.samsung.tv.bixby-context-client'")
+# Performance group: idle daemons that cost RAM/swap and never get used here.
+# Voice recommendations, AOV dashboard, Game Hub, Samsung Live promo stack,
+# AirPlay and MultiControl. All reversible with tv-root-revert / DB flags.
+PERF = ("'com.samsung.tv.utterance-recommender-core','com.samsung.tv.utterance-recommender-app',"
+        "'com.samsung.tv.aov-service','com.samsung.tv.aov-dashboard','com.samsung.tv.ghdaemon',"
+        "'com.samsung.tv.slive-daemon','com.samsung.tv.airplay-app-2','com.samsung.tv.airplay-service-2',"
+        "'com.samsung.tv.airplay-app-2-dummy','com.samsung.tv.MultiControl-Service',"
+        "'com.samsung.tv.MultiControlApp','com.samsung.tv.coba.setting.MultiControl',"
+        "'com.samsung.tv.buds-scanner','com.samsung.tv.iot-hub-control',"
+        "'com.samsung.tv.tvsensor-iot-service'")
+# Standalone systemd units behind the perf apps: they survive app-flag changes
+# because systemd starts them directly (ppid 1), so they need runtime masks.
+_PERF_FILE = os.environ.get("TV_PERF_UNITS", "/etc/tv-root-perf-units")
+_KILL_FILE = os.environ.get("TV_KILL_PROCS", "/etc/tv-root-kill-procs")
+
+
+def _load_kill_procs() -> list[str]:
+    """Process patterns to kill after each apply (bracketed so pkill cannot match itself)."""
+    try:
+        with open(_KILL_FILE) as fh:
+            return [ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")]
+    except FileNotFoundError:
+        return []
+
+
+def _load_perf_units(default: str) -> str:
+    """Allow bisecting the perf kill-list without editing this file."""
+    try:
+        with open(_PERF_FILE) as fh:
+            return " ".join(
+                ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")
+            ) or "__none__"
+    except FileNotFoundError:
+        return default
+
+
+PERF_UNITS = _load_perf_units(
+    "slive-provider-daemon bms com.samsung.tv.airplay-service-2 "
+    # telemetry / promos / unused hardware (Tier A, verified 2026-10-31)
+    "swu-auto-upgrade reporterCA emergency-log-transmitter registertv-service "
+    "pvod-appfw.pvodservice wireless-cam-service wifi-presence "
+    "mirroring-recognition-manager ambient-ua-agent pisa-service "
+    "nagsam-daemon aaa_tvs_deamon ua-manager"
+)
+OTA_UNITS = ("fw-update-service fw-update-init-download vdca-update "
+             "bootmode-swu-standalone bootmode-system-update vdsystem-update-manager")
+# data-service deliberately excluded: it is static and D-Bus activated
+# (TriggeredBy: org.tizen.tv.dataservice.busname), so "stop" is undone by the next
+# bus request - it respawns within seconds and only creates a false sense of gain.
+AD_SERVICES = "adagent-service canalysis-service org.tizen.tv.sp-kpi"
+# com.samsung.tv.swu-ui hosts the four SWU apps; ep-swupgrade is the EP-mode updater.
+SOFTWARE_UPDATE = ("'org.tizen.tv.swu','org.tizen.tv.swu-update-details','org.tizen.tv.swu-standalone',"
+                   "'org.tizen.tv.swu-voice-notification','org.tizen.ep-swupgrade'")
+VOICE_PREFS = [
+    ("db/menu/voice/voice_activated", "bool", "0", "false"),
+    ("db/menu/voice/wakeupless_status", "int", "0", "0"),
+    ("db/si_service/voice_recog_enable", "bool", "0", "false"),
+    ("db/multi-assistant/prelaunch_mode", "bool", "0", "false"),
+]
+
+
+def log(message: str) -> None:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    with LOG_FILE.open("a") as handle:
+        handle.write(f"{stamp} {message}\n")
+
+
+def sql_step(remote_sql: str, filename: str, dry: bool, group: str, name: str) -> str:
+    """Write SQL through base64 (a file sqlite3 *reads* is allowed) and run it."""
+    if dry:
+        return f"echo 'ITEM|{group}|{name}|would-apply'"
+    payload = base64.b64encode(remote_sql.encode()).decode()
+    return (
+        f"echo {payload} | base64 -d > /tmp/{filename}; "
+        f"if sqlite3 {PARSER} < /tmp/{filename} 2>/dev/null; "
+        f"then echo 'ITEM|{group}|{name}|changed'; "
+        f"else echo 'ITEM|{group}|{name}|error'; fi"
+    )
+
+
+def flags_step(ids: str, count: int, filename: str, dry: bool, group: str, name: str) -> str:
+    """Report ok when every target row already carries the intended flags."""
+    checks = ("app_disable='true' AND app_onboot='false' "
+              "AND app_autorestart='false' AND app_preload='false'")
+    payload = base64.b64encode(flags_sql(ids).encode()).decode()
+    d = "1" if dry else "0"
+    return (
+        f"n=$(sqlite3 {PARSER} \"SELECT count(*) FROM package_app_info WHERE {checks} "
+        f"AND app_id IN ({ids});\" 2>/dev/null); "
+        f"if [ \"$n\" = \"{count}\" ]; then echo 'ITEM|{group}|{name}|ok'; "
+        f"elif [ {d} = 1 ]; then echo 'ITEM|{group}|{name}|would-apply($n/{count})'; "
+        f"else echo {payload} | base64 -d > /tmp/{filename}; "
+        f"if sqlite3 {PARSER} < /tmp/{filename} 2>/dev/null; "
+        f"then echo 'ITEM|{group}|{name}|changed'; "
+        f"else echo 'ITEM|{group}|{name}|error'; fi; fi"
+    )
+
+
+def flags_sql(ids: str) -> str:
+    return (
+        "UPDATE package_app_info SET app_disable='true', app_onboot='false', "
+        f"app_autorestart='false', app_preload='false' WHERE app_id IN ({ids});\n"
+    )
+
+
+def _build_parts(groups: list[str], dry: bool) -> list[str]:
+    """Return the individual shell steps for the given groups.
+
+    Kept at step level on purpose: a single group can outgrow the command
+    budget, and a command that is too long is exactly what gets silently
+    half-executed on the TV.
+    """
+    d = "1" if dry else "0"
+    parts: list[str] = []
+
+    if "home" in groups:
+        parts.append(
+            f"cur=$(sqlite3 {APPSVC} \"SELECT pkg_name FROM appsvc WHERE operation='{MAIN_OP}';\" 2>/dev/null); "
+            f"if [ \"$cur\" = \"{HOME_APP}\" ]; then echo 'ITEM|home|home_mapping|ok'; "
+            f"elif [ {d} = 1 ]; then echo \"ITEM|home|home_mapping|would-change:$cur\"; "
+            f"else sqlite3 {APPSVC} \"UPDATE appsvc SET pkg_name='{HOME_APP}' WHERE operation='{MAIN_OP}';\" "
+            f"2>/dev/null && echo 'ITEM|home|home_mapping|changed' || echo 'ITEM|home|home_mapping|error'; fi"
+        )
+
+    if "home" in groups:
+        parts.append(
+            "cur=$(vconftool get db/appfw/startup_appid 2>/dev/null | head -1); "
+            f"case \"$cur\" in *{HOME_APP}*) echo 'ITEM|home|startup_appid|ok';; "
+            f"*) if [ {d} = 1 ]; then echo \"ITEM|home|startup_appid|would-change:$cur\"; "
+            f"else vconftool set -f -t string db/appfw/startup_appid {HOME_APP} >/dev/null 2>&1 "
+            "&& echo 'ITEM|home|startup_appid|changed' || echo 'ITEM|home|startup_appid|error'; fi;; esac"
+        )
+
+    if "memory" in groups:
+        parts.append(
+            "if vconftool get db/was/preload_by_country 2>/dev/null | grep -qi 'value = false'; "
+            "then echo 'ITEM|memory|preload_pref|ok'; "
+            f"elif [ {d} = 1 ]; then echo 'ITEM|memory|preload_pref|would-change'; "
+            "else vconftool set -f -t string db/was/preload_by_country false >/dev/null 2>&1 "
+            "&& echo 'ITEM|memory|preload_pref|changed' || echo 'ITEM|memory|preload_pref|error'; fi"
+        )
+        parts.append(
+            "echo \"ITEM|memory|meminfo|available=$(awk '/^MemAvailable/{print $2}' /proc/meminfo)kB"
+            " cma=$(awk '/^CmaFree/{print $2}' /proc/meminfo)kB\""
+        )
+
+    if "perf" in groups:
+        parts.append(flags_step(PERF, 15, "tv-perf.sql", dry, "perf", "disable_perf_apps"))
+    kill_procs = _load_kill_procs()
+    if "perf" in groups and kill_procs:
+        joined = " ".join(kill_procs)
+        if dry:
+            # --dry-run promises to change nothing, so report what is alive
+            # instead of killing it.
+            parts.append(
+                f"n=0; for p in {joined}; do pgrep -f \"$p\" >/dev/null 2>&1 && n=$((n+1)); done; "
+                "echo \"ITEM|perf|kill_procs|would-kill=$n\""
+            )
+        else:
+            parts.append(
+                f"k=0; for p in {joined}; do pkill -f \"$p\" >/dev/null 2>&1 && k=$((k+1)); done; "
+                "echo \"ITEM|perf|kill_procs|killed=$k\""
+            )
+
+    if "perf" in groups and PERF_UNITS != "__none__":
+        parts.append(
+            f"missing=''; for u in {PERF_UNITS}; do "
+            "case \"$(systemctl is-enabled $u 2>&1)\" in masked|masked-runtime) ;; "
+            "*) missing=\"$missing $u\";; esac; done; "
+            "if [ -z \"$missing\" ]; then echo 'ITEM|perf|unit_masks|ok'; "
+            f"elif [ {d} = 1 ]; then echo \"ITEM|perf|unit_masks|would-mask:$missing\"; "
+            f"else systemctl mask --runtime {PERF_UNITS} >/dev/null 2>&1; systemctl stop {PERF_UNITS} >/dev/null 2>&1; "
+            # a few Samsung units ignore SIGTERM and sit in deactivating forever
+            f"sleep 2; for u in {PERF_UNITS}; do case \"$(systemctl is-active $u 2>/dev/null)\" in "
+            "deactivating|active) systemctl kill -s KILL $u >/dev/null 2>&1;; esac; done "
+            "&& echo 'ITEM|perf|unit_masks|changed' || echo 'ITEM|perf|unit_masks|error'; fi"
+        )
+
+    if "privacy" in groups:
+        parts.append(flags_step(ADS, 8, "tv-ads.sql", dry, "privacy", "disable_ads"))
+        parts.append(
+            f"n=$(sqlite3 {PARSER} \"SELECT count(*) FROM package_app_info WHERE app_disable='true';\" "
+            "2>/dev/null); echo \"ITEM|privacy|disabled_apps|${n:-unknown}\""
+        )
+
+    if "ota" in groups:
+        parts.append(
+            f"missing=''; for u in {OTA_UNITS}; do "
+            "case \"$(systemctl is-enabled $u 2>&1)\" in masked|masked-runtime) ;; "
+            "*) missing=\"$missing $u\";; esac; done; "
+            "if [ -z \"$missing\" ]; then echo 'ITEM|ota|unit_masks|ok'; "
+            f"elif [ {d} = 1 ]; then echo \"ITEM|ota|unit_masks|would-mask:$missing\"; "
+            f"else systemctl mask --runtime {OTA_UNITS} >/dev/null 2>&1 "
+            "&& echo 'ITEM|ota|unit_masks|changed' || echo 'ITEM|ota|unit_masks|error'; fi"
+        )
+        # TV-local firmware-update app records (SWU). Registry flags are
+        # persistent and affect only this TV, unlike a LAN-wide DNS rule.
+        parts.append(flags_step(SOFTWARE_UPDATE, 5, "tv-swu.sql", dry, "ota", "disable_swu_records"))
+        for svc in AD_SERVICES.split():
+            parts.append(
+                f"st=$(systemctl is-active {svc} 2>&1); "
+                f"if [ \"$st\" != active ]; then echo \"ITEM|ota|stop_{svc}|ok($st)\"; "
+                f"elif [ {d} = 1 ]; then echo 'ITEM|ota|stop_{svc}|would-stop'; "
+                f"else systemctl stop {svc} >/dev/null 2>&1 "
+                f"&& echo 'ITEM|ota|stop_{svc}|stopped' || echo 'ITEM|ota|stop_{svc}|error'; fi"
+            )
+
+    if "voice" in groups:
+        for key, typ, val, want in VOICE_PREFS:
+            short = key.split("/")[-1]
+            if want == "0":
+                check = f"vconftool get {key} 2>/dev/null | grep -q 'value = 0 '"
+            else:
+                check = f"vconftool get {key} 2>/dev/null | grep -qi 'value = {want}'"
+            parts.append(
+                f"if {check}; then echo 'ITEM|voice|{short}|ok'; "
+                f"elif [ {d} = 1 ]; then echo 'ITEM|voice|{short}|would-change'; "
+                f"else vconftool set -f -t {typ} {key} {val} >/dev/null 2>&1 "
+                f"&& echo 'ITEM|voice|{short}|changed' || echo 'ITEM|voice|{short}|error'; fi"
+            )
+        parts.append(flags_step(VOICE, 15, "tv-voice.sql", dry, "voice", "disable_records"))
+
+    return parts
+
+
+def build_command(groups: list[str], dry: bool) -> str:
+    return "; ".join(_build_parts(groups, dry) + ["echo 'DONE'"])
+
+
+ITEM_RE = re.compile(r"ITEM\|([a-z]+)\|([A-Za-z0-9_.\-]+)\|([^;'\"\\]+)$")
+
+
+def parse_items(output: str) -> list[tuple[str, str, str]]:
+    """Pull ITEM|group|name|state records out of whatever the wrapper printed.
+
+    Two traps, both of which hid real results:
+      * `tv-root` prefixes its first line with "stdout: ", so anchoring at the
+        start of the line dropped the first item of every chunk;
+      * `tv-root` also echoes the whole command it ran, and that echo is full of
+        `echo 'ITEM|...'` literals - so matching "ITEM|" anywhere invents items
+        from the command text.
+    A real record ends the line and contains no quote or semicolon, which is
+    what the anchored-at-end pattern below enforces.
+    """
+    items = []
+    for line in output.splitlines():
+        for m in ITEM_RE.finditer(line):
+            items.append((m.group(1), m.group(2), m.group(3).strip()))
+    return items
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="apply/verify managed TV state as root")
+    parser.add_argument("--dry-run", action="store_true", help="report only, change nothing")
+    parser.add_argument("--only", default="", help="comma separated subset of: " + ",".join(DEFAULT_GROUPS))
+    args = parser.parse_args()
+
+    groups = [g.strip() for g in args.only.split(",") if g.strip()] or list(DEFAULT_GROUPS)
+    unknown = [g for g in groups if g not in DEFAULT_GROUPS]
+    if unknown:
+        print(f"unknown group(s): {', '.join(unknown)}", file=sys.stderr)
+        return 2
+
+    # One 13 KB compound command gets only partially executed (home/memory/perf ran,
+    # privacy/ota/voice silently did not), so apply in chunks that each fit.
+    # Chunking happens per *step*, not per group: a single group (perf, with its
+    # app records, kill-list and unit masks) can outgrow the budget on its own.
+    MAX_CHUNK = 4000
+    steps: list[tuple[str, str]] = []
+    for g in groups:
+        for part in _build_parts([g], args.dry_run):
+            steps.append((g, part))
+
+    chunks: list[list[tuple[str, str]]] = []
+    cur: list[tuple[str, str]] = []
+    cur_len = 0
+    for g, part in steps:
+        if len(part) + 2 > MAX_CHUNK:
+            log(f"OVERSIZE step group={g} len={len(part)} (cannot be split further)")
+        if cur and cur_len + len(part) + 2 > MAX_CHUNK:
+            chunks.append(cur)
+            cur, cur_len = [], 0
+        cur.append((g, part))
+        cur_len += len(part) + 2
+    if cur:
+        chunks.append(cur)
+
+    items: list[tuple[str, str, str]] = []
+    for i, chunk in enumerate(chunks, 1):
+        command = "; ".join(part for _, part in chunk) + "; echo 'DONE'"
+        chunk_groups = sorted({g for g, _ in chunk})
+        log(f"START chunk={i}/{len(chunks)} groups={','.join(chunk_groups)} steps={len(chunk)} dry={args.dry_run} cmd_len={len(command)}")
+        result = subprocess.run(  # noqa: S603 - fixed tool path
+            [TV_ROOT, command], capture_output=True, text=True, timeout=300, check=False
+        )
+        output = result.stdout + result.stderr
+        got = parse_items(output)
+        if not got:
+            log(f"FAILED chunk={i} no items: {output[-400:].strip()}")
+            print(output[-1500:])
+            print(f"tv-root-apply: chunk {i} acquisition or remote command failed", file=sys.stderr)
+            return 1
+        items.extend(got)
+
+    errors = changed = 0
+    for group, name, state in items:
+        if state.startswith("error"):
+            errors += 1
+        elif state.startswith(("changed", "stopped")):
+            changed += 1
+        print(f"{group:8s} {name:24s} {state}")
+        log(f"  {group} {name} {state}")
+
+    payload = {
+        "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "tv_build": TV_BUILD,
+        "dry_run": args.dry_run,
+        "groups": groups,
+        "changed": changed,
+        "errors": errors,
+        "items": {f"{g}/{n}": s for g, n, s in items},
+    }
+    if not args.dry_run:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(payload, indent=2) + "\n")
+
+    log(f"END changed={changed} errors={errors}")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Client for the TV agent relay.
+
+  tv-agent '<shell command>'          run on the TV as root, print output
+  tv-agent -t 60 '<command>'          custom timeout (seconds, default 45)
+  tv-agent --status                   is the TV loop polling?
+
+Exits with the remote command's exit code.
+"""
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+SETTINGS = "/etc/default/tv-root"
+
+
+def _setting(key: str, default: str = "") -> str:
+    """Env first, then /etc/default/tv-root, then the default."""
+    val = os.environ.get(key)
+    if val:
+        return val
+    try:
+        with open(SETTINGS, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip("\"'")
+    except OSError:
+        pass
+    return default
+
+
+# The relay this host runs; the TV polls the same URL, so it must be reachable from the TV.
+BASE = os.environ.get("TV_AGENT_URL") or _setting("TV_AGENT_URL") \
+    or "http://%s:%s" % (_setting("TV_AGENT_HOST", "127.0.0.1"), _setting("TV_AGENT_PORT", "8899"))
+
+
+def _token() -> str:
+    try:
+        with open("/etc/tv-agent.token", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        raise SystemExit("tv-agent: /etc/tv-agent.token missing - run install.sh, or set the token file")
+
+
+TOKEN = _token()
+TIMEOUT_DEFAULT = 45.0
+
+
+def req(path, data=None, method=None):
+    sep = "&" if "?" in path else "?"
+    url = "%s%s%st=%s" % (BASE, path, sep, urllib.parse.quote(TOKEN))
+    body = data.encode() if isinstance(data, str) else data
+    r = urllib.request.Request(url, data=body, method=method or ("POST" if body is not None else "GET"))
+    try:
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__.strip())
+        return 2
+    if args[0] == "--reset":
+        code, body = req("/reset", "", method="POST")
+        print("reset:", body.decode(errors="replace"))
+        return 0 if code == 200 else 1
+    if args[0] in ("--status", "-s"):
+        code, body = req("/status")
+        print(body.decode())
+        return 0 if code == 200 else 1
+    timeout = TIMEOUT_DEFAULT
+    if args[0] == "-t":
+        timeout = float(args[1])
+        args = args[2:]
+    cmd = " ".join(args)
+    code, cid = req("/enqueue", cmd)
+    if code != 200:
+        print("enqueue failed: %s %s" % (code, cid.decode(errors="replace")))
+        return 1
+    cid = cid.decode()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        code, body = req("/result?id=" + urllib.parse.quote(cid))
+        if code == 200:
+            r = json.loads(body)
+            out = r.get("out") or ""
+            if out:
+                sys.stdout.write(out)
+            return int(r.get("rc", 0))
+        time.sleep(0.4)
+    print("[tv-agent] timeout after %.0fs (command id %s still queued/running)" % (timeout, cid))
+    return 124
+
+
+if __name__ == "__main__":
+    sys.exit(main())
